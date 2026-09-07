@@ -39,13 +39,13 @@ CF_PREFIXES = (
 )
 
 DEFAULT_FREE_SNIS = [
-    "m.facebook.com",
-    "facebook.com",
-    "graph.facebook.com",
-    "whatsapp.com",
-    "web.whatsapp.com",
-    "messenger.com",
-    "cdn.whatsapp.net",
+    "digicel.ada.support",
+    "apps.apple.com",
+    "music.itune.com",
+    "events.mixpanel.com",
+    "topup.digicelgroup.com",
+    "digicelgroup.com",
+    "pusher.com",
 ]
 
 # ---------------------------------------------------------------------------

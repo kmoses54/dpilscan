@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-DPI Bypass Host Scanner
-- Discovers IPs that accept arbitrary / zero-rated SNIs
-- Tests TLS handshake acceptance (SNI injection candidates)
-- Collects cert SANs + non-CDN IPs
-- Flags potential free-data / obfuscation front hosts
+Advanced DPI Bypass Host Scanner v2
+Upgrades implemented:
+  1. Full HTTP validation after TLS handshake
+  2. Multi-port scanning
+  3. Payload export (HTTP Injector + basic Xray/VLESS style)
+  4. Result scoring
+  5. Clean JSON + CSV output
 """
 
 import ssl
 import socket
 import json
-import re
-import sys
+import csv
+import time
+import random
 import argparse
 import concurrent.futures
+from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.parse import quote
-from datetime import datetime
+from collections import defaultdict
 
 try:
     from cryptography import x509
@@ -24,7 +28,7 @@ try:
     from cryptography.hazmat.primitives import hashes
 except ImportError:
     print("[!] pip install cryptography")
-    sys.exit(1)
+    exit(1)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -38,18 +42,19 @@ CF_PREFIXES = (
     "173.245.48.", "188.114.", "190.93.240.", "197.234.240.", "198.41.128."
 )
 
+DEFAULT_PORTS = [443, 8443, 2053, 2083, 2087, 2096, 8880]
 DEFAULT_FREE_SNIS = [
+    "pusher.com",
     "digicel.ada.support",
     "apps.apple.com",
     "music.itune.com",
-    "events.mixpanel.com",
-    "topup.digicelgroup.com",
     "digicelgroup.com",
-    "pusher.com",
+    "mixpanel.com",
+    "events.mixpanel.com",
 ]
 
 # ---------------------------------------------------------------------------
-# Core functions
+# Helpers
 # ---------------------------------------------------------------------------
 
 def is_cf(ip: str) -> bool:
@@ -61,25 +66,21 @@ def resolve(host: str):
     except Exception:
         return None
 
-def get_cert_raw(host_or_ip: str, sni: str, port: int = 443, timeout: float = 5.0):
-    """Connect to host_or_ip while presenting the given SNI. Return cert + TLS version or error."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+def crt_sh(domain: str, limit: int = 40):
+    url = f"https://crt.sh/?q={quote(domain)}&output=json"
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with socket.create_connection((host_or_ip, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
-                der = ssock.getpeercert(binary_form=True)
-                cert = x509.load_der_x509_certificate(der, default_backend())
-                return {
-                    "ok": True,
-                    "tls": ssock.version(),
-                    "cert": cert,
-                    "sni_used": sni,
-                    "ip": host_or_ip,
-                }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "sni_used": sni, "ip": host_or_ip}
+        with urlopen(req, timeout=12) as r:
+            data = json.loads(r.read().decode())
+            names = set()
+            for entry in data[:limit]:
+                for n in entry.get("name_value", "").split("\n"):
+                    n = n.strip().lower()
+                    if n and "*" not in n:
+                        names.add(n)
+            return sorted(names)
+    except Exception:
+        return []
 
 def parse_cert(cert):
     if not cert:
@@ -93,137 +94,253 @@ def parse_cert(cert):
     except x509.ExtensionNotFound:
         pass
     return {
-        "subject": subj.get("commonName") or str(subj),
-        "issuer": issuer.get("commonName") or str(issuer),
-        "sans": sans,
-        "not_after": cert.not_valid_after_utc.isoformat(),
-        "fp": cert.fingerprint(hashes.SHA256()).hex()[:16] + "...",
+        "cn": subj.get("commonName", ""),
+        "issuer": issuer.get("commonName", ""),
+        "sans": sans[:8],
+        "fp": cert.fingerprint(hashes.SHA256()).hex()[:20],
     }
 
-def crt_sh(domain: str, limit: int = 50):
-    url = f"https://crt.sh/?q={quote(domain)}&output=json"
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+def create_ctx():
+    """Slightly varied context (basic fingerprint variation)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # mild variation
     try:
-        with urlopen(req, timeout=12) as r:
-            data = json.loads(r.read().decode())
-            names = set()
-            for entry in data[:limit]:
-                for n in entry.get("name_value", "").split("\n"):
-                    n = n.strip().lower()
-                    if n and "*" not in n and not n.startswith("www."):
-                        names.add(n)
-            return sorted(names)
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
     except Exception:
-        return []
-
-def probe_sni(ip: str, sni: str, port: int):
-    res = get_cert_raw(ip, sni, port)
-    if not res["ok"]:
-        return None
-    info = parse_cert(res["cert"])
-    return {
-        "ip": ip,
-        "sni": sni,
-        "tls": res["tls"],
-        "subject": info.get("subject"),
-        "sans": info.get("sans", [])[:6],
-        "issuer": info.get("issuer"),
-        "fp": info.get("fp"),
-        "cf": is_cf(ip),
-    }
+        pass
+    return ctx
 
 # ---------------------------------------------------------------------------
-# Scanner
+# Core probe (TLS + HTTP validation)
 # ---------------------------------------------------------------------------
 
-def scan(target: str, free_snis: list, port: int = 443, workers: int = 12, deep: bool = False):
-    print(f"\n[+] Target domain : {target}")
+def probe(ip: str, sni: str, port: int, timeout: float = 5.0):
+    start = time.time()
+    ctx = create_ctx()
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
+                # TLS ok
+                der = ssock.getpeercert(binary_form=True)
+                cert = x509.load_der_x509_certificate(der, default_backend())
+                cert_info = parse_cert(cert)
+                tls_ver = ssock.version()
+
+                # Full HTTP validation
+                http_ok = False
+                status = 0
+                server_hdr = ""
+                try:
+                    req = f"GET / HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+                    ssock.sendall(req.encode())
+                    data = ssock.recv(2048).decode(errors="ignore")
+                    if data.startswith("HTTP/"):
+                        line = data.split("\r\n")[0]
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            status = int(parts[1])
+                            http_ok = status in (200, 301, 302, 303, 307, 308, 403, 404)
+                        for h in data.split("\r\n"):
+                            if h.lower().startswith("server:"):
+                                server_hdr = h[7:].strip()
+                                break
+                except Exception:
+                    pass
+
+                latency = round((time.time() - start) * 1000)
+
+                # Scoring
+                score = 0
+                if http_ok:
+                    score += 40
+                if status == 200:
+                    score += 20
+                if not is_cf(ip):
+                    score += 25
+                if latency < 400:
+                    score += 10
+                if tls_ver in ("TLSv1.3", "TLSv1.2"):
+                    score += 5
+
+                return {
+                    "ok": True,
+                    "ip": ip,
+                    "port": port,
+                    "sni": sni,
+                    "tls": tls_ver,
+                    "status": status,
+                    "http_ok": http_ok,
+                    "server": server_hdr,
+                    "latency_ms": latency,
+                    "score": score,
+                    "cf": is_cf(ip),
+                    "cert": cert_info,
+                }
+    except Exception as e:
+        return {
+            "ok": False,
+            "ip": ip,
+            "port": port,
+            "sni": sni,
+            "error": str(e)[:80],
+        }
+
+# ---------------------------------------------------------------------------
+# Payload generators
+# ---------------------------------------------------------------------------
+
+def make_http_injector(ip, port, sni):
+    return f"""[Payload]
+CONNECT {sni}:443 HTTP/1.1[crlf]Host: {sni}[crlf][crlf]
+# or raw
+Payload = CONNECT [host_port] HTTP/1.1[crlf]Host: {sni}[crlf][crlf]
+ProxyIP = {ip}
+ProxyPort = {port}
+SNI = {sni}
+"""
+
+def make_xray_snippet(ip, port, sni):
+    return f"""// Xray / VLESS style outbound (adjust UUID & path)
+{{
+  "protocol": "vless",
+  "settings": {{
+    "vnext": [{{
+      "address": "{ip}",
+      "port": {port},
+      "users": [{{"id": "YOUR-UUID", "encryption": "none"}}]
+    }}]
+  }},
+  "streamSettings": {{
+    "network": "tcp",
+    "security": "tls",
+    "tlsSettings": {{
+      "serverName": "{sni}",
+      "allowInsecure": true
+    }}
+  }}
+}}
+"""
+
+# ---------------------------------------------------------------------------
+# Main scan logic
+# ---------------------------------------------------------------------------
+
+def scan(target, free_snis, ports, workers=16, timeout=5.0, out_json=None, out_csv=None):
+    print(f"\n[+] Target        : {target}")
     print(f"[+] Free SNIs     : {free_snis}")
-    print(f"[+] Port          : {port}")
-    print("-" * 60)
+    print(f"[+] Ports         : {ports}")
+    print(f"[+] Workers       : {workers}")
+    print("-" * 64)
 
-    # 1. Direct resolution + cert
-    direct_ip = resolve(target)
-    if direct_ip:
-        print(f"[+] Resolved     : {direct_ip}  {'(Cloudflare)' if is_cf(direct_ip) else ''}")
-        res = get_cert_raw(direct_ip, target, port)
-        if res["ok"]:
-            info = parse_cert(res["cert"])
-            print(f"[+] Direct cert  : {info.get('subject')}")
-            print(f"    SANs         : {info.get('sans')}")
-            print(f"    Issuer       : {info.get('issuer')}")
-    else:
-        print("[-] Direct resolve failed")
-
-    # 2. Collect candidate IPs from crt.sh + target
     candidates = set()
+    direct_ip = resolve(target)
     if direct_ip and not is_cf(direct_ip):
         candidates.add(direct_ip)
+        print(f"[+] Direct IP     : {direct_ip}")
 
-    print("[*] Querying crt.sh ...")
+    print("[*] Fetching related names from crt.sh ...")
     related = crt_sh(target)
-    print(f"[+] Related names : {len(related)}")
-    for name in related[:30]:
+    for name in related[:35]:
         ip = resolve(name)
         if ip and not is_cf(ip):
             candidates.add(ip)
+    print(f"[+] Non-CF candidate IPs : {len(candidates)}")
 
-    print(f"[+] Non-CF IPs to probe : {len(candidates)}")
     if not candidates:
         print("[-] No usable IPs found")
         return
 
-    # 3. SNI acceptance matrix
-    print(f"[*] Probing SNI acceptance ({len(candidates)} IPs × {len(free_snis)} SNIs) ...")
-    results = []
-    tasks = [(ip, sni) for ip in candidates for sni in free_snis]
+    tasks = [(ip, sni, port) for ip in candidates for sni in free_snis for port in ports]
+    print(f"[*] Total probes   : {len(tasks)}")
+    print("[*] Running ...\n")
 
+    hits = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exe:
-        futures = {exe.submit(probe_sni, ip, sni, port): (ip, sni) for ip, sni in tasks}
-        for fut in concurrent.futures.as_completed(futures):
+        futs = {exe.submit(probe, ip, sni, port, timeout): (ip, sni, port) for ip, sni, port in tasks}
+        for fut in concurrent.futures.as_completed(futs):
             r = fut.result()
-            if r:
-                results.append(r)
-                cf_tag = "CF" if r["cf"] else "OK"
-                print(f"  [HIT] {r['ip']:15}  SNI={r['sni']:<22}  TLS={r['tls']}  [{cf_tag}]")
-                print(f"         Subject: {r['subject']}")
-                if r["sans"]:
-                    print(f"         SANs   : {r['sans']}")
+            if r.get("ok") and r.get("http_ok"):
+                hits.append(r)
+                tag = "CF" if r["cf"] else "OK"
+                print(f"[HIT] {r['ip']}:{r['port']:<5}  SNI={r['sni']:<22}  "
+                      f"HTTP={r['status']:<3}  {r['latency_ms']:>4}ms  score={r['score']}  [{tag}]")
 
-    # 4. Summary
-    print("\n" + "=" * 60)
-    print(f"[+] Working SNI combinations : {len(results)}")
-    if results:
-        print("\nUsable hosts for DPI / SNI injection:")
-        seen = set()
-        for r in results:
-            key = (r["ip"], r["sni"])
-            if key in seen:
-                continue
-            seen.add(key)
-            print(f"  {r['ip']}  ←  SNI {r['sni']}  (TLS {r['tls']})")
-    else:
-        print("[-] No SNI acceptance found on non-CF IPs")
+    # Sort by score
+    hits.sort(key=lambda x: x["score"], reverse=True)
 
-    if deep and results:
-        print("\n[*] Deep mode: also testing free SNIs against the original target IP")
-        if direct_ip:
-            for sni in free_snis:
-                r = probe_sni(direct_ip, sni, port)
-                if r:
-                    print(f"  [HIT] {direct_ip} accepts SNI {sni}")
+    print("\n" + "=" * 64)
+    print(f"[+] Valid hits (HTTP + TLS) : {len(hits)}")
+
+    if not hits:
+        print("[-] No working combinations found")
+        return
+
+    print("\nTop results:")
+    for h in hits[:15]:
+        print(f"  {h['ip']}:{h['port']}  SNI={h['sni']}  score={h['score']}  "
+              f"HTTP={h['status']}  {h['latency_ms']}ms")
+
+    # Payload export for top hits
+    print("\n" + "-" * 64)
+    print("[+] Example payloads for top 3 hits:\n")
+    for h in hits[:3]:
+        print(f"### {h['ip']}:{h['port']}  SNI={h['sni']}  (score {h['score']})")
+        print(make_http_injector(h["ip"], h["port"], h["sni"]))
+        print(make_xray_snippet(h["ip"], h["port"], h["sni"]))
+        print()
+
+    # Save reports
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if out_json is None:
+        out_json = f"dpi_hits_{target}_{ts}.json"
+    if out_csv is None:
+        out_csv = f"dpi_hits_{target}_{ts}.csv"
+
+    with open(out_json, "w") as f:
+        json.dump(hits, f, indent=2)
+    print(f"[+] JSON saved → {out_json}")
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "ip", "port", "sni", "status", "latency_ms", "score", "tls", "cf", "server"
+        ])
+        writer.writeheader()
+        for h in hits:
+            writer.writerow({
+                "ip": h["ip"],
+                "port": h["port"],
+                "sni": h["sni"],
+                "status": h["status"],
+                "latency_ms": h["latency_ms"],
+                "score": h["score"],
+                "tls": h["tls"],
+                "cf": h["cf"],
+                "server": h.get("server", ""),
+            })
+    print(f"[+] CSV  saved → {out_csv}")
 
 def main():
-    ap = argparse.ArgumentParser(description="DPI Bypass / SNI Host Scanner")
-    ap.add_argument("target", help="domain to start from")
-    ap.add_argument("-p", "--port", type=int, default=443)
-    ap.add_argument("-w", "--workers", type=int, default=12)
-    ap.add_argument("--sni", nargs="+", default=DEFAULT_FREE_SNIS,
-                    help="list of SNIs to test (default: common zero-rate domains)")
-    ap.add_argument("--deep", action="store_true", help="extra probes")
+    ap = argparse.ArgumentParser(description="Advanced DPI Bypass Host Scanner")
+    ap.add_argument("target", help="starting domain")
+    ap.add_argument("--sni", nargs="+", default=DEFAULT_FREE_SNIS)
+    ap.add_argument("--ports", nargs="+", type=int, default=DEFAULT_PORTS)
+    ap.add_argument("-w", "--workers", type=int, default=16)
+    ap.add_argument("-t", "--timeout", type=float, default=5.0)
+    ap.add_argument("--json", help="custom json output path")
+    ap.add_argument("--csv", help="custom csv output path")
     args = ap.parse_args()
 
-    scan(args.target, args.sni, args.port, args.workers, args.deep)
+    scan(
+        target=args.target,
+        free_snis=args.sni,
+        ports=args.ports,
+        workers=args.workers,
+        timeout=args.timeout,
+        out_json=args.json,
+        out_csv=args.csv,
+    )
 
 if __name__ == "__main__":
     main()
